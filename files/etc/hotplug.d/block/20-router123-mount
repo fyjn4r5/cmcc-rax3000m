@@ -1,0 +1,478 @@
+#!/bin/sh
+
+password="xxxxxxxxxxxxx"
+pim=0
+
+action=${ACTION}
+devname=${DEVNAME}
+subsystem=${SUBSYSTEM}
+
+mount_base="/mnt"
+log_file="/var/log/usb-mount.log"
+mapper_base="vc_"
+modules_installed=0
+cache_file="/etc/veracrypt_hash_cache"
+
+log() {
+    echo "$(date): $1" >> "$log_file"
+}
+
+sync_system_time() {
+    local http_time_url="http://www.bing.com"
+    local http_time_url2="http://www.microsoft.com"
+    local http_time_url3="http://www.apple.com"
+
+    get_time_from_http() {
+        local url="$1"
+        local date_header
+        date_header=$(curl -sI --connect-timeout 5 --max-time 10 "$url" 2>/dev/null | grep -i "^Date:" | head -1 | sed 's/Date: *//i' | tr -d '\r')
+        if [ -n "$date_header" ]; then
+            local month day year time_str
+            month=$(echo "$date_header" | awk '{print $3}')
+            day=$(echo "$date_header" | awk '{print $2}' | tr -d ',')
+            year=$(echo "$date_header" | awk '{print $4}')
+            time_str=$(echo "$date_header" | awk '{print $5}')
+            local month_num
+            case "$month" in
+                Jan) month_num="01" ;; Feb) month_num="02" ;; Mar) month_num="03" ;;
+                Apr) month_num="04" ;; May) month_num="05" ;; Jun) month_num="06" ;;
+                Jul) month_num="07" ;; Aug) month_num="08" ;; Sep) month_num="09" ;;
+                Oct) month_num="10" ;; Nov) month_num="11" ;; Dec) month_num="12" ;;
+                *) return 1 ;;
+            esac
+            local gmt_epoch
+            gmt_epoch=$(date -d "${year}-${month_num}-${day} ${time_str}" +%s 2>/dev/null)
+            if [ -z "$gmt_epoch" ] || [ "$gmt_epoch" = "0" ]; then
+                gmt_epoch=$(date -d "${year}-${month_num}-${day}T${time_str}Z" +%s 2>/dev/null)
+            fi
+            if [ -n "$gmt_epoch" ] && [ "$gmt_epoch" != "0" ]; then
+                local cst_epoch=$((gmt_epoch + 28800))
+                date -s "@$cst_epoch" >/dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    return 0
+                fi
+            fi
+        fi
+        return 1
+    }
+
+    local current_year
+    current_year=$(date +%Y 2>/dev/null)
+    if [ "$current_year" -ge 2025 ] 2>/dev/null; then
+        log "时间已正确（$current_year年），跳过同步"
+        return 0
+    fi
+
+    log "尝试通过 HTTP 获取网络时间..."
+    for url in "$http_time_url" "$http_time_url2" "$http_time_url3"; do
+        if get_time_from_http "$url"; then
+            log "HTTP 时间同步成功: $url → $(date)"
+            return 0
+        fi
+    done
+
+    log "HTTP 时间同步失败"
+    return 1
+}
+
+ensure_all_packages() {
+    if [ "$modules_installed" -eq 1 ]; then
+        return 0
+    fi
+
+    local opkg_update_done=0
+
+    opkg_update() {
+        if [ "$opkg_update_done" -eq 0 ]; then
+            opkg update --force-signature >/dev/null 2>&1
+            opkg_update_done=1
+        fi
+    }
+
+    local need_packages=""
+    for pkg in cryptsetup blkid file xxd lsblk kmod-crypto-rmd160 kmod-crypto-sha512; do
+        if ! opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
+            need_packages="$need_packages $pkg"
+        fi
+    done
+
+    if command -v timeout >/dev/null 2>&1; then
+        :
+    else
+        if ! opkg list-installed 2>/dev/null | grep -q "^coreutils-timeout "; then
+            need_packages="$need_packages coreutils-timeout"
+        fi
+    fi
+
+    if [ -z "$need_packages" ]; then
+        log "所有依赖已安装，跳过"
+        modules_installed=1
+        return 0
+    fi
+
+    sync_system_time
+
+    log "安装缺失的软件包:$need_packages"
+    opkg_update
+    for pkg in $need_packages; do
+        opkg install --force-signature "$pkg" >> "$log_file" 2>&1
+        if [ $? -eq 0 ]; then
+            log "成功安装 $pkg"
+        else
+            log "安装 $pkg 失败"
+        fi
+    done
+
+    for mod in rmd160 sha512; do
+        if ! lsmod | grep -q "^${mod} "; then
+            modprobe "$mod" 2>/dev/null && log "加载模块 $mod 成功" || log "加载模块 $mod 失败"
+        fi
+    done
+
+    modules_installed=1
+}
+
+is_veracrypt() {
+    local device=$1
+    log "检查 $device 是否为 VeraCrypt 加密卷"
+
+    if ! dd if="$device" bs=1 count=1 >/dev/null 2>&1; then
+        log "$device 不可读，跳过"
+        return 1
+    fi
+
+    local blkid_output
+    blkid_output=$(blkid -o value -s TYPE "$device" 2>/dev/null)
+    if [ -n "$blkid_output" ]; then
+        log "$device 被 blkid 识别为文件系统类型：$blkid_output，不是 VeraCrypt 加密卷"
+        return 1
+    fi
+
+    local header_hex
+    header_hex=$(dd if="$device" bs=64 count=1 2>/dev/null | xxd -p 2>/dev/null)
+    if [ -z "$header_hex" ]; then
+        log "$device 无法读取头部数据"
+        return 1
+    fi
+    local non_zero_check
+    non_zero_check=$(echo "$header_hex" | tr -d '0')
+    if [ -z "$non_zero_check" ]; then
+        log "$device 头部数据全零，不是 VeraCrypt 加密卷"
+        return 1
+    fi
+
+    local file_output
+    file_output=$(file -s "$device" 2>/dev/null)
+    if echo "$file_output" | grep -q ": data$"; then
+        log "发现疑似VeraCrypt加密分区: $device (基于 file 检测)"
+        return 0
+    fi
+
+    log "$device 不是 VeraCrypt 加密卷"
+    return 1
+}
+
+load_cached_hash() {
+    local device_name=$1
+    if [ -f "$cache_file" ]; then
+        local cached
+        cached=$(grep "^${device_name}=" "$cache_file" 2>/dev/null | cut -d= -f2)
+        if [ -n "$cached" ]; then
+            echo "$cached"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+save_cached_hash() {
+    local device_name=$1
+    local hash_info=$2
+    local tmp_file="${cache_file}.tmp"
+    if [ -f "$cache_file" ]; then
+        grep -v "^${device_name}=" "$cache_file" > "$tmp_file" 2>/dev/null
+    else
+        touch "$tmp_file"
+    fi
+    echo "${device_name}=${hash_info}" >> "$tmp_file"
+    mv "$tmp_file" "$cache_file" 2>/dev/null
+    log "保存 hash 缓存: ${device_name}=${hash_info}"
+}
+
+try_decrypt_veracrypt() {
+    local dev_path="$1"
+    local mapper_name="$2"
+
+    if [ -e "/dev/mapper/$mapper_name" ]; then
+        log "映射设备 /dev/mapper/$mapper_name 已存在，跳过解密"
+        return 0
+    fi
+
+    if ! is_veracrypt "$dev_path"; then
+        log "$dev_path 不是 VeraCrypt 加密卷，跳过解密"
+        return 1
+    fi
+
+    local device_name
+    device_name=$(basename "$dev_path")
+
+    log "尝试解密 VeraCrypt 设备 $dev_path (PIM=$pim)"
+    local ct_exit=0
+
+    local cached_hash
+    cached_hash=$(load_cached_hash "$device_name")
+    if [ -n "$cached_hash" ]; then
+        log "尝试缓存的 hash 组合: $cached_hash"
+        local cached_cipher=$(echo "$cached_hash" | cut -d: -f1)
+        local cached_hash_algo=$(echo "$cached_hash" | cut -d: -f2)
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 30s sh -c "echo \"$password\" | cryptsetup --type tcrypt open \"$dev_path\" \"$mapper_name\" --veracrypt-pim=\"$pim\" --hash \"$cached_hash_algo\" --cipher \"$cached_cipher\" 2>>$log_file"
+            ct_exit=$?
+        else
+            echo "$password" | cryptsetup --type tcrypt open "$dev_path" "$mapper_name" --veracrypt-pim="$pim" --hash "$cached_hash_algo" --cipher "$cached_cipher" 2>>"$log_file"
+            ct_exit=$?
+        fi
+        if [ $ct_exit -eq 0 ] && [ -e "/dev/mapper/$mapper_name" ]; then
+            log "使用缓存 hash 成功解密 $dev_path"
+            sync
+            return 0
+        elif [ -e "/dev/mapper/$mapper_name" ]; then
+            log "使用缓存 hash 解密 $dev_path 成功（返回码=$ct_exit 但映射已存在）"
+            sync
+            return 0
+        else
+            log "缓存 hash 失败，清除缓存并尝试自动检测"
+        fi
+    fi
+
+    local debug_log="/tmp/cryptsetup_debug_$$.log"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 180s sh -c "echo \"$password\" | cryptsetup --type tcrypt --debug open \"$dev_path\" \"$mapper_name\" --veracrypt-pim=\"$pim\" 2>$debug_log"
+        ct_exit=$?
+    else
+        echo "$password" | cryptsetup --type tcrypt --debug open "$dev_path" "$mapper_name" --veracrypt-pim="$pim" 2>"$debug_log"
+        ct_exit=$?
+    fi
+
+    if [ $ct_exit -eq 0 ] && [ -e "/dev/mapper/$mapper_name" ]; then
+        log "成功解密 $dev_path 到 /dev/mapper/$mapper_name"
+        if [ -f "$debug_log" ]; then
+            local used_hash
+            used_hash=$(grep "TCRYPT: trying KDF:" "$debug_log" 2>/dev/null | tail -1 | sed 's/.*trying KDF: //' | sed 's/\..*//')
+            local used_cipher
+            used_cipher=$(grep "TCRYPT:  trying cipher" "$debug_log" 2>/dev/null | tail -1 | sed 's/.*trying cipher //')
+            if [ -n "$used_hash" ] && [ -n "$used_cipher" ]; then
+                save_cached_hash "$device_name" "${used_cipher}:${used_hash}"
+                log "记录成功的 hash: $used_cipher:$used_hash"
+            fi
+        fi
+        rm -f "$debug_log"
+        sync
+        return 0
+    elif [ -e "/dev/mapper/$mapper_name" ]; then
+        log "成功解密 $dev_path 到 /dev/mapper/$mapper_name (返回码=$ct_exit 但映射已存在)"
+        rm -f "$debug_log"
+        sync
+        return 0
+    else
+        log "解密 $dev_path 失败，返回码=$ct_exit"
+        rm -f "$debug_log"
+        return 1
+    fi
+}
+
+mount_and_check_router123() {
+    local dev_path="$1"
+    local is_encrypted="$2"
+    local part_name=$(basename "$dev_path")
+    local mount_point="$mount_base/$part_name"
+    local dev_to_mount="$dev_path"
+
+    if [ "$is_encrypted" -eq 1 ]; then
+        local mapper_name="${mapper_base}${part_name}"
+        dev_to_mount="/dev/mapper/$mapper_name"
+    fi
+
+    local filesystem
+    filesystem=$(blkid -o value -s TYPE "$dev_to_mount" 2>/dev/null)
+    if [ -z "$filesystem" ] && [ "$is_encrypted" -eq 0 ]; then
+        local header_data
+        header_data=$(dd if="$dev_path" bs=512 count=1 2>/dev/null | xxd -p -l 512 2>/dev/null)
+        if [ -z "$header_data" ] || ! echo "$header_data" | grep -q -E '[^0]'; then
+            log "$dev_path 无文件系统且头部数据全零，可能是无效分区，跳过挂载"
+            return 1
+        fi
+        filesystem="ext4"
+    fi
+    case "$filesystem" in
+        exfat) filesystem="exfat" ;;
+        ntfs) filesystem="ntfs-3g" ;;
+        vfat) filesystem="vfat" ;;
+        *) filesystem="ext4" ;;
+    esac
+
+    mkdir -p "$mount_point"
+
+    local mount_opts="rw"
+    case "$filesystem" in
+        vfat|exfat) mount_opts="rw,uid=1000,gid=1000,iocharset=utf8" ;;
+        ntfs-3g) mount_opts="rw,uid=1000,gid=1000,locale=en_US.UTF-8" ;;
+        ext4) mount_opts="rw" ;;
+        *) mount_opts="rw" ;;
+    esac
+
+    local actual_mount_point=""
+    local already_mounted_line
+    already_mounted_line=$(mount | grep "$dev_to_mount " | head -n1)
+    if [ -n "$already_mounted_line" ]; then
+        actual_mount_point=$(echo "$already_mounted_line" | awk '{print $3}')
+        log "$dev_to_mount 已被挂载到 $actual_mount_point"
+    elif mount | grep -q "$mount_point"; then
+        log "挂载点 $mount_point 已存在，跳过挂载 $dev_to_mount"
+        actual_mount_point="$mount_point"
+    fi
+
+    if [ -z "$actual_mount_point" ]; then
+        mkdir -p "$mount_point"
+        log "挂载 $dev_to_mount 到 $mount_point (类型=$filesystem)"
+        mount -t "$filesystem" -o "$mount_opts" "$dev_to_mount" "$mount_point" 2>>"$log_file"
+        if [ $? -ne 0 ]; then
+            log "挂载 $dev_to_mount 到 $mount_point 失败"
+            rmdir "$mount_point" 2>/dev/null
+            return 1
+        fi
+        sync
+        actual_mount_point="$mount_point"
+    fi
+
+    local root_script
+    local search_dir="$actual_mount_point"
+    root_script=$(find "$search_dir" -maxdepth 1 -type f -name '*Router123*.sh' | head -n1)
+    if [ -n "$root_script" ]; then
+        chmod +x "$root_script" || log "无法为 $root_script 添加执行权限"
+        log "找到根目录脚本：$root_script，执行脚本"
+        cd "$search_dir" || return 1
+        export LANG=en_US.UTF-8
+        bash "$root_script"
+        sync
+        log "执行 $root_script 完成，清理挂载点和映射"
+        cleanup "$dev_path"
+        return 0
+    fi
+
+    local router123_dir
+    router123_dir=$(find "$search_dir" -maxdepth 1 -type d -name '*Router123*' | head -n1)
+    if [ -n "$router123_dir" ]; then
+        local script_path
+        script_path=$(find "$router123_dir" -maxdepth 1 -type f -name '*Router123*.sh' | head -n1)
+        if [ -n "$script_path" ]; then
+            chmod +x "$script_path" || log "无法为 $script_path 添加执行权限"
+            log "找到 Router123 文件夹：$router123_dir，执行脚本：$script_path"
+            cd "$router123_dir" || return 1
+            export LANG=en_US.UTF-8
+            bash "$script_path"
+            sync
+            log "执行 $script_path 完成，清理挂载点和映射"
+            cleanup "$dev_path"
+        else
+            log "未发现 Router123*.sh 脚本在 $router123_dir"
+            cleanup "$dev_path"
+        fi
+    else
+        log "未找到 Router123* 文件夹在 $mount_point"
+        cleanup "$dev_path"
+    fi
+
+    return 0
+}
+
+cleanup() {
+    local dev_path="$1"
+    local part_name=$(basename "$dev_path")
+    local mount_point="$mount_base/$part_name"
+    local mapper_name="${mapper_base}${part_name}"
+    local dev_to_mount="/dev/mapper/$mapper_name"
+    local max_attempts=3
+    local attempt=1
+
+    local actual_mount
+    actual_mount=$(mount | grep "$dev_to_mount " | awk '{print $3}' | head -n1)
+    if [ -n "$actual_mount" ] && mount | grep -q "$actual_mount"; then
+        log "卸载 $actual_mount"
+        while [ $attempt -le $max_attempts ]; do
+            umount "$actual_mount" 2>>"$log_file" && break
+            log "卸载 $actual_mount 失败，第 $attempt 次尝试"
+            sleep 1
+            attempt=$((attempt + 1))
+        done
+        if [ $attempt -gt $max_attempts ]; then
+            log "卸载 $actual_mount 失败，尝试强制卸载"
+            umount -l "$actual_mount" 2>>"$log_file" || log "强制卸载 $actual_mount 失败"
+        fi
+    fi
+
+    attempt=1
+    if mount | grep -q "$mount_point"; then
+        log "卸载 $mount_point"
+        while [ $attempt -le $max_attempts ]; do
+            umount "$mount_point" 2>>"$log_file" && break
+            log "卸载 $mount_point 失败，第 $attempt 次尝试"
+            sleep 1
+            attempt=$((attempt + 1))
+        done
+        if [ $attempt -gt $max_attempts ]; then
+            log "卸载 $mount_point 失败，尝试强制卸载"
+            umount -l "$mount_point" 2>>"$log_file" || log "强制卸载 $mount_point 失败"
+        fi
+        rmdir "$mount_point" 2>/dev/null
+        log "卸载 $mount_point 完成"
+    fi
+
+    if [ -e "/dev/mapper/$mapper_name" ]; then
+        log "关闭 VeraCrypt 映射 $mapper_name"
+        cryptsetup close "$mapper_name" 2>>"$log_file" || log "关闭 $mapper_name 失败"
+    fi
+}
+
+case "$action" in
+    add)
+        log "处理设备：action=$action, devname=$devname, subsystem=$subsystem"
+
+        if ! echo "$devname" | grep -qE "^sd[a-z]"; then
+            log "设备 $devname 不是 sd 开头，跳过"
+            exit 0
+        fi
+
+        ensure_all_packages
+
+        if [ ! -b "/dev/$devname" ]; then
+            log "错误：/dev/$devname 不是有效的块设备"
+            exit 1
+        fi
+
+        dev_list="/dev/$devname"
+        if echo "$devname" | grep -qE "^sd[a-z]$"; then
+            last_partition=$(lsblk -l -o NAME /dev/$devname | grep -E "^${devname}[0-9]+$" | tail -n 1 | awk '{print "/dev/"$1}')
+            if [ -n "$last_partition" ]; then
+                dev_list="$last_partition"
+            else
+                dev_list="/dev/$devname"
+            fi
+        fi
+
+        for dev_path in $dev_list; do
+            part_name=$(basename "$dev_path")
+            mapper_name="${mapper_base}${part_name}"
+            log "处理设备 $dev_path"
+
+            if try_decrypt_veracrypt "$dev_path" "$mapper_name"; then
+                mount_and_check_router123 "$dev_path" 1
+            fi
+        done
+        ;;
+    remove)
+        log "处理移除设备：$devname"
+        cleanup "/dev/$devname"
+        sync
+        ;;
+esac
