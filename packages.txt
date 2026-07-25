@@ -7,7 +7,10 @@
 luci-ssl
 luci-theme-bootstrap
 luci-i18n-base-zh-cn
-luci-app-commands
+luci-app-commands      # 自定义命令执行
+luci-app-ttyd          # Web终端（浏览器SSH）
+luci-app-filemanager   # 文件管理器
+luci-app-ksmbd         # SMB文件共享（访问路由器文件）
 # luci-app-filetransfer  # 23.05中不存在此包，已注释
 
 # ---------- 脚本运行依赖 ----------
@@ -23,6 +26,11 @@ aria2
 # ---------- WiFi 相关 ----------
 iwinfo
 wireless-tools
+
+# ---------- 网速优化 ----------
+kmod-mtk-hnat         # MediaTek硬件NAT加速（转发性能翻倍）
+kmod-sched-cake       # CAKE智能队列（核心依赖）
+luci-app-sqm          # SQM智能限速（一体化：QoS+CAKE+流量控制）
 
 # ---------- USB 自动挂载 & VeraCrypt ----------
 cryptsetup
@@ -40,15 +48,40 @@ kmod-fs-vfat
 kmod-fs-ext4
 
 # ---------- USB 驱动 ----------
-kmod-usb-storage
-kmod-usb3
-kmod-usb2
+kmod-usb3                  # USB 3.0驱动
+kmod-usb2                  # USB 2.0驱动
+kmod-usb-storage           # USB存储
+kmod-usb-storage-extras    # 额外USB存储支持
+kmod-scsi-core             # SCSI核心（U盘需要）
+kmod-usb-net               # USB网卡基础
+kmod-usb-net-rtl8153       # RTL8153 USB千兆网卡
+kmod-usb-serial            # USB串口
+usbutils                   # lsusb设备查看
+hdparm                     # 硬盘性能调优
 
 # ---------- 文件传输 ----------
 openssh-sftp-server
 
 # ---------- WiFi 破解 ----------
-aircrack-ng
-hcxdumptool
-hcxtools
-tcpdump
+aircrack-ng        # 经典WiFi破解（抓包+字典破解）
+hcxdumptool        # 抓WPA握手包
+hcxtools           # 抓包转换工具
+tcpdump            # 网络抓包
+reaver             # WPS暴力破解（需WPS开启）
+bully              # WPS暴力破解（替代reaver）
+pixiewps           # WPS Pixie Dust秒破
+mdk4               # WiFi协议攻击（Deauth等）
+macchanger         # MAC地址修改
+
+# ---------- VeraCrypt 加密模块 ----------
+kmod-crypto-user      # 用户空间加密接口（cryptsetup依赖）
+kmod-crypto-misc      # 杂项加密模块
+kmod-crypto-aes       # AES加密（VeraCrypt默认）
+kmod-crypto-cbc       # CBC分组模式
+kmod-crypto-xts       # XTS磁盘加密模式
+kmod-crypto-rmd160    # RIPEMD-160哈希
+kmod-crypto-sha512    # SHA-512哈希
+kmod-crypto-sha256    # SHA-256哈希
+kmod-crypto-blake2s   # BLAKE2s哈希
+kmod-dm               # 设备映射（LVM支持）
+kmod-loop             # 回环设备
