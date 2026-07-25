@@ -8,8 +8,11 @@ luci-ssl
 luci-theme-bootstrap
 luci-i18n-base-zh-cn
 luci-app-commands      # 自定义命令执行
+luci-i18n-commands-zh-cn
 luci-app-ttyd          # Web终端（浏览器SSH）
+luci-i18n-ttyd-zh-cn
 luci-app-ksmbd         # SMB文件共享（访问路由器文件）
+luci-i18n-ksmbd-zh-cn
 
 # ---------- 脚本运行依赖 ----------
 curl
@@ -28,6 +31,7 @@ wireless-tools
 # ---------- 网速优化 ----------
 kmod-sched-cake       # CAKE智能队列
 luci-app-sqm          # SQM智能限速
+luci-i18n-sqm-zh-cn
 
 # ---------- USB 自动挂载 & VeraCrypt ----------
 cryptsetup
